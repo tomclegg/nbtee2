@@ -17,10 +17,11 @@ type Tee struct {
 }
 
 type reader struct {
-	ch   chan []byte
-	todo []byte
-	buf  []byte
-	w    *Tee
+	ch       chan []byte
+	todo     []byte
+	buf      []byte
+	w        *Tee
+	lowwater int
 }
 
 // Write sends p to all readers that aren't overflowing. Write never
@@ -55,14 +56,17 @@ func (w *Tee) Close() error {
 // everything sent to Write(), dropping all buffered writes in order
 // to catch up whenever it falls behind by `highwater` writes.
 //
+// If there is no data ready when Read() is called, Read blocks until
+// `lowwater` writes have arrived.
+//
 // It is safe to call the reader's Close() method while a Read() is in
 // progress, and after calling Close(), it is safe (but unnecessary)
 // to call Read() until EOF.
-func (w *Tee) NewReader(highwater int) io.ReadCloser {
+func (w *Tee) NewReader(lowwater, highwater int) io.ReadCloser {
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
 	ch := make(chan []byte, highwater)
-	r := &reader{ch: ch, w: w}
+	r := &reader{ch: ch, w: w, lowwater: lowwater}
 	if w.readers == nil {
 		w.readers = make(map[*reader]bool, 1)
 	}
@@ -71,48 +75,54 @@ func (w *Tee) NewReader(highwater int) io.ReadCloser {
 }
 
 func (r *reader) WriteTo(w io.Writer) (n int64, err error) {
-	for {
-		r.emptyIfFull()
-		buf, ok := <-r.ch
-		if !ok {
-			err = io.EOF
-			return
+	defer r.Close()
+	for err == nil {
+		err = r.fillTodo()
+		if len(r.todo) == 0 {
+			continue
 		}
 		var nn int
-		nn, err = w.Write(<-r.ch)
+		nn, err = w.Write(r.todo)
 		n += int64(nn)
-		if err != nil {
-			return
-		}
+		r.todo = r.todo[nn:]
 	}
+	return
 }
 
 // Read implements io.Reader.
 func (r *reader) Read(p []byte) (int, error) {
+	err := r.fillTodo()
+	n := copy(p, r.todo)
+	r.todo = r.todo[n:]
+	return n, err
+}
+
+// Fill r.todo with the next incoming buf. If an incoming buf isn't
+// ready, block until r.lowwater buffers have been read into r.todo.
+func (r *reader) fillTodo() (err error) {
 	if len(r.todo) > 0 {
-		n := copy(p, r.todo)
-		r.todo = r.todo[n:]
-		return n, nil
+		return nil
 	}
-	incoming, ok := <-r.ch
-	if !ok {
-		return 0, io.EOF
+	lowwater := 1
+	if r.lowwater > 1 && len(r.ch) == 0 {
+		lowwater = r.lowwater
 	}
-	if cap(r.ch) > 1 && len(r.ch) >= cap(r.ch)-1 {
+	r.buf = r.buf[:0]
+	for i := 0; i < lowwater; i++ {
+		buf, ok := <-r.ch
+		if !ok {
+			err = io.EOF
+			break
+		}
+		r.buf = append(r.buf, buf...)
+	}
+	if cap(r.ch) > 2 && len(r.ch) >= cap(r.ch)-1 {
 		for len(r.ch) > 0 {
 			<-r.ch
 		}
 	}
-	if len(incoming) <= len(p) {
-		r.todo = nil
-	} else {
-		if len(incoming)-len(p) > cap(r.buf) {
-			r.buf = make([]byte, 0, len(incoming)-len(p))
-		}
-		r.buf = r.buf[:copy(r.buf, incoming[len(p):])]
-		r.todo = r.buf
-	}
-	return copy(p, incoming), nil
+	r.todo = r.buf
+	return
 }
 
 // Close releases resources. Readers should be closed after use.
