@@ -16,9 +16,9 @@ var _ = check.Suite(&Suite{})
 
 func (s *Suite) TestSmallBuffer(c *check.C) {
 	w := &Tee{}
-	r0 := w.NewReader(0)
-	r1 := w.NewReader(1)
-	r2 := w.NewReader(2)
+	r0 := w.NewReader(0, 0)
+	r1 := w.NewReader(0, 1)
+	r2 := w.NewReader(0, 2)
 	w.Write([]byte{1, 2, 3})
 	w.Write([]byte{4, 5, 6})
 	w.Write([]byte{7, 8, 9})
@@ -28,7 +28,7 @@ func (s *Suite) TestSmallBuffer(c *check.C) {
 	buf2, _ := ioutil.ReadAll(r2)
 	c.Check(buf0, check.DeepEquals, []byte{})
 	c.Check(buf1, check.DeepEquals, []byte{1, 2, 3})
-	c.Check(buf2, check.DeepEquals, []byte{1, 2, 3})
+	c.Check(buf2, check.DeepEquals, []byte{1, 2, 3, 4, 5, 6})
 }
 
 func (s *Suite) TestWriter(c *check.C) {
@@ -36,7 +36,7 @@ func (s *Suite) TestWriter(c *check.C) {
 	var wg sync.WaitGroup
 	for i := 0; i < 256; i++ {
 		w.Write([]byte{byte(i), byte(i) + 1, byte(i) + 2})
-		r := w.NewReader(256)
+		r := w.NewReader(0, 256)
 		if i%7 == 3 {
 			go func() {
 				defer r.Close()

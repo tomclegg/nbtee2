@@ -1,6 +1,7 @@
 package nbtee2
 
 import (
+	"context"
 	"io"
 	"sync"
 )
@@ -22,6 +23,7 @@ type reader struct {
 	buf      []byte
 	w        *Tee
 	lowwater int
+	ctx      context.Context
 }
 
 // Write sends p to all readers that aren't overflowing. Write never
@@ -52,7 +54,7 @@ func (w *Tee) Close() error {
 	return nil
 }
 
-// NewReader returns a new io.ReadCloser that reads a copy of
+// NewReaderContext returns a new io.ReadCloser that reads a copy of
 // everything sent to Write(), dropping all buffered writes in order
 // to catch up whenever it falls behind by `highwater` writes.
 //
@@ -62,16 +64,21 @@ func (w *Tee) Close() error {
 // It is safe to call the reader's Close() method while a Read() is in
 // progress, and after calling Close(), it is safe (but unnecessary)
 // to call Read() until EOF.
-func (w *Tee) NewReader(lowwater, highwater int) io.ReadCloser {
+func (w *Tee) NewReaderContext(ctx context.Context, lowwater, highwater int) io.ReadCloser {
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
 	ch := make(chan []byte, highwater)
-	r := &reader{ch: ch, w: w, lowwater: lowwater}
+	r := &reader{ch: ch, w: w, lowwater: lowwater, ctx: ctx}
 	if w.readers == nil {
 		w.readers = make(map[*reader]bool, 1)
 	}
 	w.readers[r] = true
 	return r
+}
+
+// NewReader calls NewReaderContext with context.Background().
+func (w *Tee) NewReader(lowwater, highwater int) io.ReadCloser {
+	return w.NewReaderContext(context.Background(), lowwater, highwater)
 }
 
 func (r *reader) WriteTo(w io.Writer) (n int64, err error) {
@@ -98,7 +105,8 @@ func (r *reader) Read(p []byte) (int, error) {
 }
 
 // Fill r.todo with the next incoming buf. If an incoming buf isn't
-// ready, block until r.lowwater buffers have been read into r.todo.
+// ready, block until r.lowwater buffers have been read into r.todo or
+// r.ctx is cancelled.
 func (r *reader) fillTodo() (err error) {
 	if len(r.todo) > 0 {
 		return nil
@@ -108,13 +116,17 @@ func (r *reader) fillTodo() (err error) {
 		lowwater = r.lowwater
 	}
 	r.buf = r.buf[:0]
-	for i := 0; i < lowwater; i++ {
-		buf, ok := <-r.ch
-		if !ok {
-			err = io.EOF
-			break
+	for i := 0; i < lowwater && err == nil; i++ {
+		select {
+		case buf, ok := <-r.ch:
+			if !ok {
+				err = io.EOF
+			} else {
+				r.buf = append(r.buf, buf...)
+			}
+		case <-r.ctx.Done():
+			err = r.ctx.Err()
 		}
-		r.buf = append(r.buf, buf...)
 	}
 	if cap(r.ch) > 2 && len(r.ch) >= cap(r.ch)-1 {
 		for len(r.ch) > 0 {
